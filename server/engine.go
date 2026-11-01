@@ -13,6 +13,7 @@ import (
 
 	"github.com/Autumn-27/artex/agent"
 	"github.com/Autumn-27/artex/db"
+	"github.com/Autumn-27/artex/guard"
 	"github.com/Autumn-27/artex/intercept"
 	"github.com/Autumn-27/norma/harness"
 	"github.com/Autumn-27/norma/llm"
@@ -92,11 +93,13 @@ const (
 	errDetachedWorkerNotReady      = "Worker 가 아직 준비되지 않았습니다"
 )
 
-// retryableWorkerModelError excludes errors already handled by the task router.
-// In particular, a quota error after partial streaming advances the task cursor
-// for the next LLM call but must not replay this whole intent on the backup.
+// retryableWorkerModelError excludes errors already handled by the task router
+// and deterministic request failures. Replaying the whole intent cannot repair
+// an Ollama context-window 400 (or another rejected 4xx request).
+// A quota error after partial streaming advances the task cursor for the next
+// LLM call but must not replay this whole intent on the backup.
 func retryableWorkerModelError(reason harness.TerminalReason, err error) bool {
-	return reason == harness.ReasonModelError && !isTaskLLMRuntimeError(err)
+	return reason == harness.ReasonModelError && !isTaskLLMRuntimeError(err) && isRetryableStreamError(err)
 }
 
 // Engine drives the event-driven exploration loop with real LLM agents
@@ -873,6 +876,14 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 		if e.isSettling(t.ID) {
 			return
 		}
+		// A queued diagnostic task can arrive here with a buffered Resume
+		// notification even though Run skipped its initial planner kick. Let
+		// its first Worker settle before planning from the collected evidence.
+		if _, diagnostic := diagnosticBootstrapGoal(t); diagnostic {
+			if active, err := t.Store.HasActiveIntentByOrigin("diagnostic-bootstrap"); err == nil && active {
+				return
+			}
+		}
 		// goalless（人工直投）分支：任务已无 open 目标时 planner 不跑——跑了会重判
 		// met→cancelExec 杀掉用户经主 agent 直投的意图。是否结束改由 frontier 决定：
 		// 还有 open/running 意图 → 保持 running、静默等待；意图已全部跑干 → 落 done。
@@ -901,6 +912,11 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 		ectx := e.clockCtx(e.execContextFor(ctx, t.ID), t, false) // cancellable by Pause; 带任务 deadline
 		if ectx.Err() != nil || e.IsDeleting(t.ID) {
 			return
+		}
+		t.refreshDiagnosticScope()
+		ectx = guard.WithDiagnosticGuard(ectx, t.Guard)
+		if t.Guard.DiagnosticEnabled() {
+			ectx = intercept.WithTaskContext(ectx, t.ID, "planner", emit)
 		}
 		log.Printf("[planner] task %s 规划中…(%s 触发)", t.ID, src)
 		// round marker: each Plan() is one planner round; emit a boundary so the
@@ -1038,6 +1054,8 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 		emit(a)
 	}
 	label := fmt.Sprintf("%s · #%d", name, iid)
+	t.refreshDiagnosticScope()
+	workCtx = guard.WithDiagnosticGuard(workCtx, t.Guard)
 	workCtx = intercept.WithTaskContext(workCtx, t.ID, label, taskEmit)
 	// nudges 有意建在 model_error 重跑循环之外:空转续跑的上限是「这条意图」的总量，
 	// 重跑一轮不该把额度清零重来。

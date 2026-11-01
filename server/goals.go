@@ -64,6 +64,13 @@ func (s *Server) startTaskEngine(t *Task) {
 	if ctx.Err() != nil || s.engine.IsDeleting(t.ID) {
 		return
 	}
+	// A diagnostic handoff already has a persisted goal and a bounded intent.
+	// Starting the engine directly lets its Worker verify that intent immediately.
+	if goal, ok := diagnosticBootstrapGoal(t); ok {
+		s.engine.emitActivity(t, db.Activity{Worker: "planner", Kind: "text", Summary: goal})
+		s.engine.Run(s.ctx, t)
+		return
+	}
 	s.engine.emitActivity(t, db.Activity{Worker: "planner", Kind: "round",
 		Summary: goalBreakdownRound0Summary})
 	goals := s.createGoals(ctx, t, func(r db.Activity) {

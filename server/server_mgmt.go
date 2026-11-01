@@ -25,6 +25,7 @@ import (
 
 	"github.com/Autumn-27/artex/agent"
 	"github.com/Autumn-27/artex/db"
+	"github.com/Autumn-27/artex/ollamaendpoint"
 	"github.com/Autumn-27/norma/llm"
 	"github.com/Autumn-27/norma/skill"
 )
@@ -1884,9 +1885,42 @@ func (s *Server) pgSaveProfile(w http.ResponseWriter, r *http.Request) {
 	if p.Format != "openai" || p.MaxTokensField != llm.MaxTokensFieldCompletion {
 		p.MaxTokensField = ""
 	}
+	if p.Format != "bedrock-marketplace" {
+		p.InvokeSchema, p.PromptStyle = "", ""
+	}
+	if !db.ValidCyberAccessProgram(p.Format, p.CyberAccessProgram) {
+		writeErr(w, 400, "cyber_access_program must be empty or standard/daybreak_blue/daybreak_red for openai-responses")
+		return
+	}
+	if p.Format == "bedrock" || p.Format == "bedrock-converse" || p.Format == "bedrock-marketplace" {
+		key := p.APIKey
+		if key == "" && p.ID != 0 {
+			if stored, err := pg.ProfileByID(p.ID); err == nil && stored != nil && stored.Format == p.Format {
+				key = stored.APIKey
+			}
+		}
+		if key == "" {
+			writeErr(w, 400, db.ErrBedrockAPIKeyRequired.Error())
+			return
+		}
+		cfg := agent.ConfigFrom(p.Format, p.Model, p.BaseURL, key, p.Proxy)
+		cfg.InvokeSchema, cfg.PromptStyle = p.InvokeSchema, p.PromptStyle
+		cfg.MaxTokens = p.MaxTokens
+		cfg.SessionHeaderKey = p.SessionHeaderKey
+		cfg.ThinkingType, cfg.ReasoningEffort = p.ThinkingType, p.ReasoningEffort
+		cfg.CyberAccessProgram = p.CyberAccessProgram
+		if _, err := cfg.NewProvider(); err != nil {
+			writeErr(w, 400, err.Error())
+			return
+		}
+	}
 	id, err := pg.SaveProfile(&p)
 	if err != nil {
-		writeErr(w, 500, err.Error())
+		if errors.Is(err, db.ErrBedrockAPIKeyRequired) || errors.Is(err, db.ErrRemoteOllamaProfile) {
+			writeErr(w, 400, err.Error())
+		} else {
+			writeErr(w, 500, err.Error())
+		}
 		return
 	}
 	// Editing a profile rebuilds any task pinned to it on its next round. Reapply
@@ -2044,30 +2078,67 @@ func (s *Server) pgLLMPoolReset(w http.ResponseWriter, r *http.Request) {
 // the OpenAI path, it falls back to the OpenAI endpoint at the stripped root.
 func (s *Server) pgListModels(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Provider  string `json:"provider"` // "openai" | "anthropic"
-		BaseURL   string `json:"base_url"`
-		APIKey    string `json:"api_key"`
-		Proxy     string `json:"proxy"`
-		ProfileID *int64 `json:"profile_id"` // fallback: use stored key from this profile
+		OllamaRemote ollamaendpoint.Options `json:"ollama_remote"`
+		Provider     string                 `json:"provider"` // "openai" | "anthropic"
+		BaseURL      string                 `json:"base_url"`
+		APIKey       string                 `json:"api_key"`
+		Proxy        string                 `json:"proxy"`
+		ProfileID    *int64                 `json:"profile_id"` // fallback: use stored key from this profile
 	}
 	if err := decode(r, &req); err != nil {
 		writeErr(w, 400, err.Error())
 		return
 	}
-	// Resolve API key: form input > profile stored key.
+	provider := strings.TrimSpace(req.Provider)
+	if provider == ollamaendpoint.Remote {
+		cfg := agent.ConfigFrom(provider, "", req.BaseURL, req.APIKey, req.Proxy)
+		cfg.OllamaRemote = req.OllamaRemote
+		if err := s.resolveRemoteOllamaKey(&cfg, req.ProfileID); err != nil {
+			writeJSON(w, 200, map[string]any{"ok": false, "error": err.Error()})
+			return
+		}
+		status, err := agent.CheckOllamaStatus(r.Context(), cfg)
+		if err != nil {
+			writeJSON(w, 200, map[string]any{"ok": false, "error": err.Error()})
+			return
+		}
+		writeJSON(w, 200, map[string]any{"ok": true, "models": status.Models})
+		return
+	}
+	if provider == "bedrock" || provider == "bedrock-converse" || provider == "bedrock-marketplace" {
+		// Bedrock Runtime does not expose a models-list API for these routes.
+		// The UI accepts an explicit model or inference-profile ID instead.
+		writeJSON(w, 200, map[string]any{"ok": false, "error": "Bedrock 모델 ID를 직접 입력하세요"})
+		return
+	}
+	// Ollama needs no key. Never forward a key from a previously selected
+	// hosted profile to a local model endpoint.
 	apiKey := strings.TrimSpace(req.APIKey)
-	if apiKey == "" && req.ProfileID != nil {
+	if provider == "ollama" {
+		apiKey = ""
+	}
+	if apiKey == "" && provider != "ollama" && req.ProfileID != nil {
 		if p, err := s.m.pg.ProfileByID(*req.ProfileID); err == nil && p != nil {
-			apiKey = p.APIKey
+			if p.Format == provider {
+				apiKey = p.APIKey
+			}
 		}
 	}
-	if apiKey == "" {
+	if apiKey == "" && provider != "ollama" {
 		writeJSON(w, 200, map[string]any{"ok": false, "error": errMgmtNoAPIKey})
 		return
 	}
 
 	baseURL := strings.TrimRight(strings.TrimSpace(req.BaseURL), "/")
-	provider := strings.TrimSpace(req.Provider)
+
+	// OrcaRouter has its own discovery contract: the same origin serves both the
+	// chat catalog (?capability=chat) and the parser that drops non-chat records.
+	// Keep it out of the OpenAI candidate ladder so a non-chat model can never
+	// leak into the selector through a fallback path.
+	if provider == agent.OrcaRouterProviderID {
+		s.listOrcaRouterModels(w, r, baseURL, apiKey, req.Proxy)
+		return
+	}
 
 	// Candidate endpoints to try in order. Some Anthropic-compatible providers
 	// (e.g. DeepSeek) implement /v1/messages under an /anthropic path but expose
@@ -2091,14 +2162,22 @@ func (s *Server) pgListModels(w http.ResponseWriter, r *http.Request) {
 
 	var candidates []candidate
 	switch provider {
-	case "openai", "openai-responses":
+	case "openai", "openai-responses", "ollama":
 		// Responses API shares the OpenAI model list at /v1/models; tolerate a full
 		// endpoint URL of either format.
 		if baseURL == "" {
-			baseURL = "https://api.openai.com/v1"
+			if provider == "ollama" {
+				baseURL = agent.ConfigFrom("ollama", "", "", "", "").BaseURL
+			} else {
+				baseURL = "https://api.openai.com/v1"
+			}
 		}
 		b := strings.TrimRight(strings.TrimSuffix(strings.TrimSuffix(baseURL, "/chat/completions"), "/responses"), "/")
-		candidates = append(candidates, candidate{b + "/models", bearerHdr()})
+		h := http.Header{}
+		if provider != "ollama" {
+			h = bearerHdr()
+		}
+		candidates = append(candidates, candidate{b + "/models", h})
 	default: // anthropic
 		if baseURL == "" {
 			baseURL = "https://api.anthropic.com"
@@ -2175,6 +2254,51 @@ func (s *Server) pgListModels(w http.ResponseWriter, r *http.Request) {
 		lastErr = errMgmtNoModelList
 	}
 	writeJSON(w, 200, map[string]any{"ok": false, "error": lastErr})
+}
+
+// listOrcaRouterModels implements model discovery for the named OrcaRouter
+// provider. The server holds the key (it is never sent to the browser), asks the
+// configured origin for the authoritative chat catalog, and returns only the
+// IDs the chat adapter can speak. A failed discovery returns an explicit error
+// so the UI can show its verified seed as degraded instead of an empty list.
+func (s *Server) listOrcaRouterModels(w http.ResponseWriter, r *http.Request, baseURL, apiKey, proxy string) {
+	transport := &http.Transport{}
+	if p := strings.TrimSpace(proxy); p != "" {
+		if pu, err := url.Parse(p); err == nil {
+			transport.Proxy = http.ProxyURL(pu)
+		}
+	}
+	client := &http.Client{Transport: transport, Timeout: 20 * time.Second}
+	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet,
+		agent.OrcaRouterModelsURL(baseURL, "chat"), nil)
+	if err != nil {
+		writeJSON(w, 200, map[string]any{"ok": false, "error": errMgmtBuildReqFail + err.Error()})
+		return
+	}
+	req.Header.Set("Accept", "application/json")
+	if apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+apiKey)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		writeJSON(w, 200, map[string]any{"ok": false, "error": errMgmtReqFail + err.Error()})
+		return
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	if resp.StatusCode != http.StatusOK {
+		writeJSON(w, 200, map[string]any{
+			"ok":    false,
+			"error": fmt.Sprintf(errMgmtAPIReturned, resp.StatusCode, string(body[:min(len(body), 512)])),
+		})
+		return
+	}
+	models, err := agent.ParseOrcaRouterCatalog(body)
+	if err != nil {
+		writeJSON(w, 200, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	writeJSON(w, 200, map[string]any{"ok": true, "models": models})
 }
 
 // --- prompt template helpers (Go text/template + catalog 白名单) ---

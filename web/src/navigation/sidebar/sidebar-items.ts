@@ -13,6 +13,7 @@ import {
   MessageSquare,
   Network,
   Plug,
+  Radar,
   Radio,
   ScrollText,
   Settings2,
@@ -75,12 +76,6 @@ export const sidebarItems: NavGroup[] = [
         icon: Target,
         subItems: [
           { id: "offensive-overview", title: "Offensive overview", url: "/offensive", icon: LayoutDashboard },
-          {
-            id: "offensive-assessments",
-            title: "API · 소스 코드 진단",
-            url: "/offensive/assessments",
-            icon: ClipboardList,
-          },
           { id: "tasks", title: "Tasks", url: "/function/tasks", icon: Target },
           { id: "assets", title: "Assets", url: "/function/assets", icon: Network },
           { id: "findings", title: "Findings", url: "/function/findings", icon: Bug },
@@ -92,7 +87,7 @@ export const sidebarItems: NavGroup[] = [
         title: "Defensive",
         icon: ShieldAlert,
         subItems: [
-          { id: "defensive-cases", title: "Cases", url: "/defensive", icon: ShieldAlert },
+          { id: "defensive-hunting", title: "Autonomous hunting", url: "/defensive/hunting", icon: Radar },
           { id: "security-sources", title: "Log connections", url: "/function/purple/sources", icon: Plug },
         ],
       },

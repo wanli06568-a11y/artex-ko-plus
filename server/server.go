@@ -21,9 +21,11 @@ import (
 
 	"github.com/Autumn-27/artex/agent"
 	"github.com/Autumn-27/artex/db"
+	"github.com/Autumn-27/artex/hunting"
 	"github.com/Autumn-27/artex/intercept"
 	"github.com/Autumn-27/artex/llmpool"
 	"github.com/Autumn-27/artex/llmrec"
+	"github.com/Autumn-27/artex/ollamaendpoint"
 	"github.com/Autumn-27/artex/report"
 	"github.com/Autumn-27/artex/traffic"
 	"github.com/Autumn-27/norma/llm"
@@ -109,6 +111,7 @@ type Server struct {
 
 	offensiveReviewInitMu  sync.Mutex
 	offensiveReviewRuntime *offensiveReviewRuntime
+	offensiveDiagnosticMu  sync.Mutex
 
 	skillDir string // root directory for skill subdirectories
 	jwtKey   []byte // HS256 signing key loaded from / generated into dataDir/jwt.key
@@ -144,6 +147,14 @@ type Server struct {
 	// Historical investigations have a separate, bounded read-only runtime.
 	investigationMu     sync.Mutex
 	investigationCancel map[int64]context.CancelFunc
+	// scenarioMu makes repeated generate requests share the cached draft before
+	// another paid model call starts. Generation is intentionally bounded to one.
+	scenarioMu sync.Mutex
+	// Vulnerability-led hunting is independent of the existing scenario workflow.
+	huntMu             sync.Mutex
+	huntCancel         map[int64]context.CancelFunc
+	huntResearch       *hunting.Researcher     // optional trusted runtime adapter, never user input
+	huntTrendCollector *hunting.TrendCollector // optional trusted test adapter, never user input
 
 	// triggerQ buffers P3 trigger fires PER AGENT. A per-agent "pump" launches runs up
 	// to a concurrency limit derived from the agent's策略: serial → limit 1 (+ optional
@@ -252,6 +263,10 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 		if _, err := m.pg.RecoverDefensiveCaseRuns(ctx); err != nil {
 			log.Printf("[defensive] recover: %v", err)
 		}
+		if _, err := m.pg.RecoverHunts(ctx); err != nil {
+			log.Printf("[hunting] recover: %v", err)
+		}
+		go s.scheduleHuntTrends(ctx)
 		agent.PromptOverride = func(key string) (string, bool) {
 			a, err := m.pg.GetAgentByKey(key)
 			if err != nil || a == nil {
@@ -404,6 +419,14 @@ func (s *Server) agentRunSeconds(key string) int {
 	return a.RunSecs
 }
 
+// applyProfileContextWindow preserves provider-specific defaults when a saved
+// profile leaves its context window unset, while honoring explicit values.
+func applyProfileContextWindow(cfg *agent.Config, windowK int) {
+	if windowK > 0 || (!cfg.IsOllama() && !cfg.IsBedrockMarketplace()) {
+		cfg.ContextWindowK = windowK
+	}
+}
+
 // loadLLMConfig reads the active LLM profile from PG (llm_profiles).
 func (s *Server) loadLLMConfig() (agent.Config, bool) {
 	p, err := s.m.pg.ActiveProfile()
@@ -411,27 +434,38 @@ func (s *Server) loadLLMConfig() (agent.Config, bool) {
 		return agent.Config{}, false
 	}
 	cfg := agent.ConfigFrom(p.Format, p.Model, p.BaseURL, p.APIKey, p.Proxy)
+	cfg.OllamaRemote = p.OllamaRemote
+	cfg.InvokeSchema, cfg.PromptStyle = p.InvokeSchema, p.PromptStyle
 	cfg.RatePerSecond, cfg.RatePerMinute = p.RatePerSecond, p.RatePerMinute
-	cfg.ContextWindowK = p.ContextWindowK
+	applyProfileContextWindow(&cfg, p.ContextWindowK)
 	cfg.ThinkingType = p.ThinkingType
 	cfg.ReasoningEffort = p.ReasoningEffort
+	cfg.CyberAccessProgram = p.CyberAccessProgram
 	cfg.Stream = p.Streaming
-	cfg.MaxTokens, cfg.MaxTokensField = p.MaxTokens, p.MaxTokensField
+	if p.MaxTokens > 0 || (!cfg.IsBedrock() && !cfg.IsBedrockConverse()) {
+		cfg.MaxTokens = p.MaxTokens
+	}
+	cfg.MaxTokensField = p.MaxTokensField
 	cfg.SessionHeaderKey = p.SessionHeaderKey
 	s.applyProfileRetry(&cfg, p)
-	if cfg.APIKey == "" {
+	if cfg.APIKey == "" && !cfg.IsOllama() {
 		return cfg, false
 	}
 	s.cfgMu.Lock()
 	s.llmProf = p.Name
 	s.cfgMu.Unlock()
+	if cfg.IsRemoteOllama() {
+		if err := cfg.ValidateRemoteOllama(); err != nil {
+			return cfg, false
+		}
+	}
 	return cfg, true
 }
 
 // saveLLMConfig persists the LLM config as the active "default" profile in PG.
 func (s *Server) saveLLMConfig(cfg agent.Config) error {
-	// cfg.Provider() already returns one of the three valid format strings
-	// (anthropic / openai / openai-responses), matching the DB CHECK constraint.
+	// cfg.Provider() returns the persisted provider name, matching the DB
+	// format constraint (including Bedrock Marketplace's custom wire format).
 	format := cfg.Provider()
 	var id int64
 	// 这个 legacy 端点的请求体不含轮询/收发/输出上限参数,故把库里已存的值原样带回 —
@@ -443,6 +477,7 @@ func (s *Server) saveLLMConfig(cfg agent.Config) error {
 	var maxTokens int
 	var maxTokensField string
 	var sessionHeaderKey string
+	invokeSchema, promptStyle := cfg.InvokeSchema, cfg.PromptStyle
 	var retry db.RetryOverride
 	if profs, _ := s.m.pg.ListProfiles(); profs != nil {
 		for _, p := range profs {
@@ -450,6 +485,14 @@ func (s *Server) saveLLMConfig(cfg agent.Config) error {
 				id, priority, poolExclude, streaming = p.ID, p.Priority, p.PoolExclude, p.Streaming
 				maxTokens, maxTokensField = p.MaxTokens, p.MaxTokensField
 				sessionHeaderKey = p.SessionHeaderKey
+				if p.Format == format && format == "bedrock-marketplace" {
+					if invokeSchema == "" {
+						invokeSchema = p.InvokeSchema
+					}
+					if promptStyle == "" {
+						promptStyle = p.PromptStyle
+					}
+				}
 				retry = p.Retry
 				break
 			}
@@ -457,10 +500,12 @@ func (s *Server) saveLLMConfig(cfg agent.Config) error {
 	}
 	newID, err := s.m.pg.SaveProfile(&db.LLMProfile{
 		ID: id, Name: "default", Format: format, Model: cfg.Model, BaseURL: cfg.BaseURL, Proxy: cfg.Proxy,
-		APIKey: cfg.APIKey, RatePerSecond: cfg.RatePerSecond, RatePerMinute: cfg.RatePerMinute,
+		OllamaRemote: cfg.OllamaRemote, APIKey: cfg.APIKey, RatePerSecond: cfg.RatePerSecond, RatePerMinute: cfg.RatePerMinute,
 		ContextWindowK: cfg.ContextWindowK, ThinkingType: cfg.ThinkingType, ReasoningEffort: cfg.ReasoningEffort, IsDefault: true,
-		Priority: priority, PoolExclude: poolExclude, Streaming: streaming,
+		CyberAccessProgram: cfg.CyberAccessProgram,
+		Priority:           priority, PoolExclude: poolExclude, Streaming: streaming,
 		MaxTokens: maxTokens, MaxTokensField: maxTokensField, SessionHeaderKey: sessionHeaderKey,
+		InvokeSchema: invokeSchema, PromptStyle: promptStyle,
 		Retry: retry,
 	})
 	if err != nil {
@@ -574,24 +619,35 @@ func (s *Server) applyLLM(cfg agent.Config) error {
 	return nil
 }
 
-// loadProfileConfig builds an agent.Config from a specific profile id (with its key).
-// ok=false when the profile is missing or has no api key.
+// loadProfileConfig builds an agent.Config from a specific profile id.
+// Hosted providers need a key; local Ollama does not.
 func (s *Server) loadProfileConfig(id int64) (agent.Config, bool) {
 	p, err := s.m.pg.ProfileByID(id)
 	if err != nil || p == nil {
 		return agent.Config{}, false
 	}
 	cfg := agent.ConfigFrom(p.Format, p.Model, p.BaseURL, p.APIKey, p.Proxy)
+	cfg.OllamaRemote = p.OllamaRemote
+	cfg.InvokeSchema, cfg.PromptStyle = p.InvokeSchema, p.PromptStyle
 	cfg.RatePerSecond, cfg.RatePerMinute = p.RatePerSecond, p.RatePerMinute
-	cfg.ContextWindowK = p.ContextWindowK
+	applyProfileContextWindow(&cfg, p.ContextWindowK)
 	cfg.ThinkingType = p.ThinkingType
 	cfg.ReasoningEffort = p.ReasoningEffort
+	cfg.CyberAccessProgram = p.CyberAccessProgram
 	cfg.Stream = p.Streaming
-	cfg.MaxTokens, cfg.MaxTokensField = p.MaxTokens, p.MaxTokensField
+	if p.MaxTokens > 0 || (!cfg.IsBedrock() && !cfg.IsBedrockConverse()) {
+		cfg.MaxTokens = p.MaxTokens
+	}
+	cfg.MaxTokensField = p.MaxTokensField
 	cfg.SessionHeaderKey = p.SessionHeaderKey
 	s.applyProfileRetry(&cfg, p)
-	if cfg.APIKey == "" {
+	if cfg.APIKey == "" && !cfg.IsOllama() {
 		return cfg, false
+	}
+	if cfg.IsRemoteOllama() {
+		if err := cfg.ValidateRemoteOllama(); err != nil {
+			return cfg, false
+		}
 	}
 	return cfg, true
 }
@@ -735,7 +791,6 @@ func (s *Server) chatAgentRef() *agent.ChatAgent {
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	s.registerSideRoutes(mux)
-	s.registerOffensiveAssessments(mux)
 
 	// Auth routes — exempt from JWT check (handled in requireAuth)
 	mux.HandleFunc("GET /api/auth/status", s.authStatus)
@@ -758,6 +813,10 @@ func (s *Server) Handler() http.Handler {
 
 	mux.HandleFunc("GET /api/tasks", s.listTasks)
 	mux.HandleFunc("POST /api/tasks", s.createTask)
+	// The added scanner endpoints are retired. Keep historical records on disk,
+	// but direct new work through the original /api/tasks workflow.
+	mux.HandleFunc("/api/offensive", retiredOffensiveAssessment)
+	mux.HandleFunc("/api/offensive/", retiredOffensiveAssessment)
 	mux.HandleFunc("GET /api/task-categories", s.pgListTaskCategories)
 	mux.HandleFunc("POST /api/task-categories", s.pgCreateTaskCategory)
 	mux.HandleFunc("PATCH /api/task-categories/{id}", s.pgRenameTaskCategory)
@@ -847,6 +906,7 @@ func (s *Server) Handler() http.Handler {
 	s.registerFindingTraffic(mux)
 	s.registerPurple(mux)
 	s.registerDefensiveCases(mux)
+	s.registerHunts(mux)
 	s.registerClosedLoop(mux)
 	mux.HandleFunc("GET /api/aegis/overview", s.aegisOverview)
 	mux.HandleFunc("GET /api/exploration/findings/{id}", s.getFinding)
@@ -994,6 +1054,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/llm/pool", s.pgLLMPoolStatus)
 	mux.HandleFunc("POST /api/llm/pool/reset", s.pgLLMPoolReset)
 	mux.HandleFunc("POST /api/llm/models", s.pgListModels)
+	mux.HandleFunc("POST /api/llm/ollama/status", s.ollamaStatus)
 
 	// 拦截规则管理
 	mux.HandleFunc("GET /api/intercept/rules", s.interceptListRules)
@@ -1378,56 +1439,72 @@ func (s *Server) getLLM(w http.ResponseWriter, r *http.Request) {
 	s.cfgMu.Lock()
 	defer s.cfgMu.Unlock()
 	writeJSON(w, 200, map[string]any{
-		"configured":       s.llmOn,
-		"provider":         s.llmCfg.Provider(),
-		"model":            s.llmCfg.Model,
-		"base_url":         s.llmCfg.BaseURL,
-		"proxy":            s.llmCfg.Proxy,
-		"key_set":          s.llmCfg.APIKey != "",
-		"rate_per_second":  s.llmCfg.RatePerSecond,
-		"rate_per_minute":  s.llmCfg.RatePerMinute,
-		"context_window_k": s.llmCfg.ContextWindowK,
-		"thinking_type":    s.llmCfg.ThinkingType,
-		"reasoning_effort": s.llmCfg.ReasoningEffort,
+		"configured":           s.llmOn,
+		"provider":             s.llmCfg.Provider(),
+		"model":                s.llmCfg.Model,
+		"base_url":             s.llmCfg.BaseURL,
+		"proxy":                s.llmCfg.Proxy,
+		"key_set":              s.llmCfg.APIKey != "",
+		"rate_per_second":      s.llmCfg.RatePerSecond,
+		"rate_per_minute":      s.llmCfg.RatePerMinute,
+		"context_window_k":     s.llmCfg.ContextWindowK,
+		"thinking_type":        s.llmCfg.ThinkingType,
+		"reasoning_effort":     s.llmCfg.ReasoningEffort,
+		"cyber_access_program": s.llmCfg.CyberAccessProgram,
 	})
 }
 
 // setLLM configures the LLM at runtime. A blank api_key keeps the existing key.
 func (s *Server) setLLM(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Provider        string  `json:"provider"`
-		Model           string  `json:"model"`
-		BaseURL         string  `json:"base_url"`
-		Proxy           string  `json:"proxy"`
-		APIKey          string  `json:"api_key"`
-		RatePerSecond   float64 `json:"rate_per_second"`
-		RatePerMinute   float64 `json:"rate_per_minute"`
-		ContextWindowK  int     `json:"context_window_k"`
-		ThinkingType    string  `json:"thinking_type"`
-		ReasoningEffort string  `json:"reasoning_effort"`
+		OllamaRemote       ollamaendpoint.Options `json:"ollama_remote"`
+		Provider           string                 `json:"provider"`
+		Model              string                 `json:"model"`
+		BaseURL            string                 `json:"base_url"`
+		Proxy              string                 `json:"proxy"`
+		APIKey             string                 `json:"api_key"`
+		RatePerSecond      float64                `json:"rate_per_second"`
+		RatePerMinute      float64                `json:"rate_per_minute"`
+		ContextWindowK     int                    `json:"context_window_k"`
+		ThinkingType       string                 `json:"thinking_type"`
+		ReasoningEffort    string                 `json:"reasoning_effort"`
+		CyberAccessProgram string                 `json:"cyber_access_program"`
+		InvokeSchema       string                 `json:"invoke_schema"`
+		PromptStyle        string                 `json:"prompt_style"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeErr(w, 400, err.Error())
 		return
 	}
 	cfg := agent.ConfigFrom(req.Provider, req.Model, req.BaseURL, req.APIKey, req.Proxy)
+	cfg.OllamaRemote = req.OllamaRemote
+	applyMarketplaceInvokeOptions(&cfg, req.InvokeSchema, req.PromptStyle)
 	cfg.RatePerSecond, cfg.RatePerMinute = req.RatePerSecond, req.RatePerMinute
 	cfg.ThinkingType = req.ThinkingType
 	cfg.ReasoningEffort = req.ReasoningEffort
+	cfg.CyberAccessProgram = req.CyberAccessProgram
 	if k := req.ContextWindowK; k > 0 { // 0 = keep default (200K); cap at 1M
 		if k > 1000 {
 			k = 1000
 		}
 		cfg.ContextWindowK = k
 	}
-	if cfg.APIKey == "" {
+	if cfg.APIKey == "" && !cfg.IsOllama() {
 		s.cfgMu.Lock()
-		cfg.APIKey = s.llmCfg.APIKey // keep existing key if not re-entered
+		if s.llmCfg.Provider() == cfg.Provider() {
+			cfg.APIKey = s.llmCfg.APIKey // keep the key only for the same provider
+		}
 		s.cfgMu.Unlock()
 	}
-	if cfg.APIKey == "" {
+	if cfg.APIKey == "" && !cfg.IsOllama() {
 		writeErr(w, 400, "api_key required")
 		return
+	}
+	if cfg.IsRemoteOllama() {
+		if err := s.resolveRemoteOllamaKey(&cfg, nil); err != nil {
+			writeErr(w, 400, err.Error())
+			return
+		}
 	}
 	// Validate provider construction before persisting it as the active profile.
 	if _, err := cfg.NewProvider(); err != nil {
@@ -1454,26 +1531,39 @@ func (s *Server) setLLM(w http.ResponseWriter, r *http.Request) {
 // testLLM makes a real minimal completion to verify the config works.
 func (s *Server) testLLM(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Provider         string `json:"provider"`
-		Model            string `json:"model"`
-		BaseURL          string `json:"base_url"`
-		Proxy            string `json:"proxy"`
-		APIKey           string `json:"api_key"`
-		ThinkingType     string `json:"thinking_type"`
-		ReasoningEffort  string `json:"reasoning_effort"`
-		ProfileID        *int64 `json:"profile_id"`         // 测已存 profile 时传入：api_key 为空则用它存的 key
-		Streaming        *bool  `json:"streaming"`          // 省略=流式，与保存 profile 时同一套默认
-		SessionHeaderKey string `json:"session_header_key"` // 非空=测试时也带该自定义会话头，值为一次性随机 session id
+		OllamaRemote       ollamaendpoint.Options `json:"ollama_remote"`
+		Provider           string                 `json:"provider"`
+		Model              string                 `json:"model"`
+		BaseURL            string                 `json:"base_url"`
+		Proxy              string                 `json:"proxy"`
+		APIKey             string                 `json:"api_key"`
+		ThinkingType       string                 `json:"thinking_type"`
+		ReasoningEffort    string                 `json:"reasoning_effort"`
+		CyberAccessProgram *string                `json:"cyber_access_program"`
+		ProfileID          *int64                 `json:"profile_id"`         // 测已存 profile 时传入：api_key 为空则用它存的 key
+		Streaming          *bool                  `json:"streaming"`          // 省略=流式，与保存 profile 时同一套默认
+		SessionHeaderKey   string                 `json:"session_header_key"` // 非空=测试时也带该自定义会话头，值为一次性随机 session id
+		InvokeSchema       string                 `json:"invoke_schema"`
+		PromptStyle        string                 `json:"prompt_style"`
+		MaxTokens          int                    `json:"max_tokens"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeErr(w, 400, err.Error())
 		return
 	}
 	cfg := agent.ConfigFrom(req.Provider, req.Model, req.BaseURL, req.APIKey, req.Proxy)
+	cfg.OllamaRemote = req.OllamaRemote
+	applyMarketplaceInvokeOptions(&cfg, req.InvokeSchema, req.PromptStyle)
+	if req.MaxTokens > 0 {
+		cfg.MaxTokens = req.MaxTokens
+	}
 	// mirror production: send the SAME thinking params so a provider that rejects the
 	// reasoning_effort/thinking field fails the test too (no false "test ok, run 400").
 	cfg.ThinkingType = req.ThinkingType
 	cfg.ReasoningEffort = req.ReasoningEffort
+	if req.CyberAccessProgram != nil {
+		cfg.CyberAccessProgram = *req.CyberAccessProgram
+	}
 	// 同理，收发模式也照该 profile 的选择来：只支持其中一种通道的端点必须在这里就
 	// 暴露，而不是等会话里才发现"测试通过的配置根本跑不动"。
 	if req.Streaming != nil {
@@ -1486,26 +1576,45 @@ func (s *Server) testLLM(w http.ResponseWriter, r *http.Request) {
 	// API Key 解析优先级：表单输入 > 指定 profile 存的 key > 全局配置的 key。
 	// 已存 profile 的 key 不回传浏览器，所以测试已存配置时表单为空，需从 DB 取。
 	// 会话头名同理：表单未带时用已存 profile 的值兜底。
-	if req.ProfileID != nil && (cfg.APIKey == "" || cfg.SessionHeaderKey == "") {
+	if !cfg.IsRemoteOllama() && req.ProfileID != nil && (cfg.APIKey == "" || cfg.SessionHeaderKey == "" || req.CyberAccessProgram == nil || cfg.InvokeSchema == "" || cfg.PromptStyle == "") {
 		if p, err := s.m.pg.ProfileByID(*req.ProfileID); err == nil && p != nil {
-			if cfg.APIKey == "" {
+			if cfg.APIKey == "" && !cfg.IsOllama() && p.Format == cfg.Provider() {
 				cfg.APIKey = p.APIKey
 			}
 			if cfg.SessionHeaderKey == "" {
 				cfg.SessionHeaderKey = p.SessionHeaderKey
 			}
+			if req.CyberAccessProgram == nil && p.Format == cfg.Provider() {
+				cfg.CyberAccessProgram = p.CyberAccessProgram
+			}
+			if p.Format == cfg.Provider() && cfg.IsBedrockMarketplace() {
+				if cfg.InvokeSchema == "" {
+					cfg.InvokeSchema = p.InvokeSchema
+				}
+				if cfg.PromptStyle == "" {
+					cfg.PromptStyle = p.PromptStyle
+				}
+			}
 		}
 	}
-	if cfg.APIKey == "" {
+	if cfg.APIKey == "" && !cfg.IsOllama() {
 		s.cfgMu.Lock()
-		cfg.APIKey = s.llmCfg.APIKey
+		if s.llmCfg.Provider() == cfg.Provider() {
+			cfg.APIKey = s.llmCfg.APIKey
+		}
 		s.cfgMu.Unlock()
 	}
-	if cfg.APIKey == "" {
+	if cfg.APIKey == "" && !cfg.IsOllama() {
 		writeJSON(w, 200, map[string]any{"ok": false, "error": errLLMTestNoAPIKey})
 		return
 	}
-	// 重试参数【不】带进连接测试:测试有 30s 硬超时,把配置的重试次数/长间隔叠上去
+	if cfg.IsRemoteOllama() {
+		if err := s.resolveRemoteOllamaKey(&cfg, req.ProfileID); err != nil {
+			writeJSON(w, 200, map[string]any{"ok": false, "error": err.Error()})
+			return
+		}
+	}
+	// 重试参数【不】带进连接测试:测试有 30s 超时(Ollama 为 90s),把配置的重试次数/长间隔叠上去
 	// 只会让一个本来能用的端点测成"超时失败"。测试看的是"这个端点通不通",重试节奏
 	// 是跑起来之后的事。
 	lat, reply, err := agent.TestConnection(r.Context(), cfg)
@@ -1517,6 +1626,15 @@ func (s *Server) testLLM(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{
 		"ok": true, "latency_ms": lat.Milliseconds(), "model": cfg.Model, "reply": truncateReply(reply),
 	})
+}
+
+// InvokeModel request templates belong only to Marketplace profiles. The UI
+// carries defaults for these fields even when a different format is selected;
+// never pass them to Bedrock Converse or other providers during a test.
+func applyMarketplaceInvokeOptions(cfg *agent.Config, schema, prompt string) {
+	if cfg.IsBedrockMarketplace() {
+		cfg.InvokeSchema, cfg.PromptStyle = schema, prompt
+	}
 }
 
 // truncateReply clips a connection-test reply for display. A model told to answer
